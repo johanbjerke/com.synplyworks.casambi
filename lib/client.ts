@@ -22,6 +22,20 @@ interface SocketStates {
   [id: string]: WebSocket;
 }
 
+// Tracks whether the OPEN handshake for a given wire/socket has been
+// acknowledged by the server. Control messages must only be sent on a
+// wire that has been successfully opened, otherwise the server silently
+// drops them (this is the main cause of the "read-only" behaviour).
+interface WireState {
+  opened: boolean;
+  // queued control messages waiting for the wire to open
+  queue: string[];
+}
+
+interface WireStates {
+  [id: string]: WireState;
+}
+
 export interface Device {
   // scheduleId: string;
   id: string;
@@ -95,6 +109,10 @@ export default class Client {
   protected wire = 1;
 
   protected sockets: SocketStates = {};
+
+  protected wireStates: WireStates = {};
+
+  protected timers: { [key: string]: NodeJS.Timer } = {};
 
   protected headers: Dictionary = {
     'Content-Type': 'application/json',
@@ -189,17 +207,52 @@ export default class Client {
   ) {
     const network = await this.getNetwork(networkId);
     const socket = this.getSocket(network);
-    console.log('Client.updateDeviceState', deviceId, targetControls, socket.readyState === WebSocket.OPEN);
+    const sessionKey = `${network.id}-${network.sessionId}`;
 
-    if (socket.readyState === WebSocket.OPEN) {
-      const data = JSON.stringify({
-        wire: this.wire,
-        method: 'controlUnit',
-        id: deviceId,
-        targetControls,
-      });
+    const data = JSON.stringify({
+      wire: this.wire,
+      method: 'controlUnit',
+      id: deviceId,
+      targetControls,
+    });
 
-      socket.send(decodeURIComponent(escape(data)));
+    const wireState = this.wireStates[sessionKey];
+    console.log(
+      'Client.updateDeviceState',
+      deviceId,
+      JSON.stringify(targetControls),
+      'socketOpen=', socket.readyState === WebSocket.OPEN,
+      'wireOpened=', wireState ? wireState.opened : false,
+    );
+
+    // Only send once the wire has been OPENed (acknowledged by the server).
+    // If the socket is connected but the wire is not yet open, queue the
+    // message and flush it from the OPEN-ack / unitChanged handler.
+    if (socket.readyState === WebSocket.OPEN && wireState && wireState.opened) {
+      this.rawSend(socket, data);
+    } else if (wireState) {
+      console.log('Client.updateDeviceState: wire not ready, queueing control message');
+      wireState.queue.push(data);
+    } else {
+      console.log('Client.updateDeviceState: no wire state available, message dropped');
+    }
+  }
+
+  // Centralised raw send so all outgoing messages are logged consistently.
+  protected rawSend(socket: WebSocket, data: string) {
+    console.log('Client.rawSend ->', data);
+    socket.send(data);
+  }
+
+  protected flushQueue(socket: WebSocket, sessionKey: string) {
+    const wireState = this.wireStates[sessionKey];
+    if (!wireState || !wireState.opened) {
+      return;
+    }
+    while (wireState.queue.length > 0) {
+      const msg = wireState.queue.shift() as string;
+      console.log('Client.flushQueue: sending queued control message');
+      this.rawSend(socket, msg);
     }
   }
 
@@ -208,10 +261,14 @@ export default class Client {
 
     if (!this.sockets[sessionKey]) {
       console.log(`Opening socket for networkId ${network.id} and sessionId ${network.sessionId}`);
+      // Pass the API key as the WebSocket sub-protocol, as required by Casambi.
       this.sockets[sessionKey] = new WebSocket('wss://door.casambi.com/v1/bridge/', this.token);
       const socket = this.sockets[sessionKey];
 
-      // ping every 4 minutes to keep socket alive
+      // initialise wire state for this socket
+      this.wireStates[sessionKey] = { opened: false, queue: [] };
+
+      // ping every 4 minutes to keep socket alive (server closes idle wires after 5 min)
       const timer = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) {
           // console.log('ping to keep alive: ', timer);
@@ -220,13 +277,14 @@ export default class Client {
             wire: this.wire,
           });
 
-          socket.send(decodeURIComponent(escape(PING)));
+          this.rawSend(socket, PING);
         }
       }, 4 * 60 * 1000);
+      this.timers[sessionKey] = timer;
 
-      socket.on('open', (event: WebSocket.Event): void => {
+      socket.on('open', (): void => {
         const reference = 'REFERENCE-ID'; // Reference handle created by client to link messages to relevant callbacks
-        const type = 1; // Client type, use value 1 (FRONTEND)
+        const type = 1; // Client type, use value 1 (FRONTEND) - required to be allowed to control units
 
         const OPEN = JSON.stringify({
           method: 'open',
@@ -236,21 +294,48 @@ export default class Client {
           wire: this.wire,
           type,
         });
-        socket.send(decodeURIComponent(escape(OPEN)));
+        console.log('WebSocket open: sending OPEN message');
+        this.rawSend(socket, OPEN);
       });
 
       socket.onmessage = (event: WebSocket.MessageEvent): void => {
-        // console.log("webSocket.onmessage(event): ", event);
+        let data: any;
+        try {
+          data = JSON.parse(event.data.toString());
+        } catch (e) {
+          console.log('Client: failed to parse websocket message', event.data.toString());
+          return;
+        }
 
-        const data = JSON.parse(event.data.toString());
-        // console.log("webSocket.onmessage(event).data: ", data);
+        // Log every server response so that silent rejections become visible.
+        // The server reports problems via `wireStatus` (e.g. "invalidValueType",
+        // "tooManyWires", "unauthorized") which were previously ignored entirely.
+        if ('wireStatus' in data) {
+          console.log('Client: webSocket server wireStatus response:', JSON.stringify(data));
+
+          // A successful OPEN is acknowledged with a wireStatus of "open"
+          // (and includes the network state). Mark the wire as opened and
+          // flush any control messages that were queued while connecting.
+          if (data.wireStatus === 'open') {
+            this.wireStates[sessionKey].opened = true;
+            console.log(`Client: wire ${this.wire} opened for ${sessionKey}, flushing queue`);
+            this.flushQueue(socket, sessionKey);
+          } else {
+            // Any other wireStatus is an error condition worth surfacing.
+            console.log(`Client: WARNING wire status "${data.wireStatus}" - control messages may be rejected`);
+          }
+        }
 
         if ('method' in data) {
           if (data.method === 'unitChanged') {
-            // Initial device state info and device state changed event
-            // In case data.id is not in "network.units" list (fetched via API)
-            // this event can be ignored
-            console.log("Client: webSocket.onmessage(event) method=unitChanged data: ", data);
+            // Initial device state info and device state changed event.
+            // Receiving these confirms the wire is alive; ensure it is marked open.
+            if (!this.wireStates[sessionKey].opened) {
+              this.wireStates[sessionKey].opened = true;
+              this.flushQueue(socket, sessionKey);
+            }
+
+            console.log("Client: webSocket.onmessage(event) method=unitChanged data: ", JSON.stringify(data));
             if (sessionKey in this.unitChangedNetworkCallbacks) {
               this.unitChangedNetworkCallbacks[sessionKey].forEach(({ deviceId, unitChangedCallback }) => {
                 if (deviceId === data.id) {
@@ -263,11 +348,12 @@ export default class Client {
             // Network setting or composition has somehow changed.
             // Fetching latest network information from REST API and
             // re-sending the OPEN message to WebSocket is recommended. *
-
+            console.log('Client: networkUpdated event received');
           } else if (data.method === 'peerChanged') {
             // Devices online changed event, for example new device has joined the network
             // In most cases no action required.
-
+          } else {
+            console.log('Client: unhandled websocket method', data.method, JSON.stringify(data));
           }
         }
       };
@@ -279,7 +365,7 @@ export default class Client {
       });
 
       socket.onclose = (event: WebSocket.CloseEvent): void => {
-        console.log('WebSocket Closed! Reconnecting...');
+        console.log('WebSocket Closed! Reconnecting...', event && (event as any).code, event && (event as any).reason);
 
         this.reconnect(network, timer);
       };
@@ -292,9 +378,20 @@ export default class Client {
   }
 
   protected reconnect(network: Network, timer: NodeJS.Timer) {
+    const sessionKey = `${network.id}-${network.sessionId}`;
     clearInterval(timer);
-    delete this.sockets[`${network.id}-${network.sessionId}`];
-    this.getSocket(network); // reconnect socket
+    if (this.timers[sessionKey]) {
+      clearInterval(this.timers[sessionKey]);
+      delete this.timers[sessionKey];
+    }
+    delete this.sockets[sessionKey];
+    delete this.wireStates[sessionKey];
+
+    // Debounce reconnect to avoid the connection storm that previously caused
+    // Casambi to revoke this app's API key (10000+ connections/minute).
+    setTimeout(() => {
+      this.getSocket(network); // reconnect socket
+    }, 5000);
   }
 
   protected isAuthenticated = (): boolean => {
@@ -323,6 +420,7 @@ export default class Client {
     });
 
     if (!response.ok) {
+      this.isLoggingIn = false;
       console.log(`authentication failed for ${this.username}: `, await response.text());
       throw new Error(`authentication failed: ${await response.text()}`);
     }

@@ -19,5 +19,8 @@
   },
   "0.4.0": {
     "en": "reuse connection and sockets, implemented reconnect functionality"
+  },
+  "0.5.0": {
+    "en": "Fix silent control failures: send control only after the websocket wire is opened (queue otherwise), log all server wireStatus responses, use dedicated OnOff control, add colour/temperature support, debounce reconnects to avoid API-key throttling."
   }
 }
