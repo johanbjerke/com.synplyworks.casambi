@@ -313,12 +313,15 @@ export default class Client {
         if ('wireStatus' in data) {
           console.log('Client: webSocket server wireStatus response:', JSON.stringify(data));
 
-          // A successful OPEN is acknowledged with a wireStatus of "open"
-          // (and includes the network state). Mark the wire as opened and
-          // flush any control messages that were queued while connecting.
-          if (data.wireStatus === 'open') {
+          // A successful OPEN is acknowledged with a wireStatus indicating
+          // success (and includes the network state). Casambi has used both
+          // "open" and, more recently, "openWireSucceed" for this. Mark the
+          // wire as opened and flush any control messages that were queued
+          // while connecting.
+          const openStatuses = ['open', 'openWireSucceed'];
+          if (openStatuses.includes(data.wireStatus)) {
             this.wireStates[sessionKey].opened = true;
-            console.log(`Client: wire ${this.wire} opened for ${sessionKey}, flushing queue`);
+            console.log(`Client: wire ${this.wire} opened for ${sessionKey} (status "${data.wireStatus}"), flushing queue`);
             this.flushQueue(socket, sessionKey);
           } else {
             // Any other wireStatus is an error condition worth surfacing.

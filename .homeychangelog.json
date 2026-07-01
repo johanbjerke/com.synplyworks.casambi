@@ -22,5 +22,8 @@
   },
   "0.5.0": {
     "en": "Fix silent control failures: send control only after the websocket wire is opened (queue otherwise), log all server wireStatus responses, use dedicated OnOff control, add colour/temperature support, debounce reconnects to avoid API-key throttling."
+  },
+  "0.6.0": {
+    "en": "Fix app crash on startup with newer Homey CLI (guard inspector.open), and recognise Casambi's updated wire-open acknowledgement (\"openWireSucceed\") so control commands are sent again."
   }
 }

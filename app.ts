@@ -5,9 +5,18 @@ import LuminaireDevice from './drivers/luminaires/device';
 
 const Homey = require('homey');
 
-// Start debuger
+// Start debugger only if one isn't already active. Newer Homey CLI versions
+// start their own inspector, so calling inspector.open() again throws
+// "Inspector is already activated" and crashes the app on startup.
 if (process.env.DEBUG === "1") {
-  require("inspector").open(9229, "0.0.0.0", false);
+  const inspector = require("inspector");
+  if (!inspector.url()) {
+    try {
+      inspector.open(9229, "0.0.0.0", false);
+    } catch (err) {
+      console.log("Could not open inspector (probably already active):", err);
+    }
+  }
 }
 
 export default class CasambiApp extends Homey.App {
