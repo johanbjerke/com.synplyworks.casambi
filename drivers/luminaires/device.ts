@@ -16,13 +16,18 @@ export default class LuminaireDevice extends Homey.Device {
     this.registerMultipleCapabilityListener(['onoff', 'dim'], async ({ onoff, dim }) => {
       try {
         if (onoff === false) {
-          // Use the dedicated OnOff control for turning off, with Dimmer as
-          // a fallback for fixtures that only expose a Dimmer control.
+          // These luminaires expose a Dimmer control. OnOff alone does not
+          // change them; level 0 is what actually turns them off.
           await this.app!.updateDeviceState(this, { OnOff: { value: 0 }, Dimmer: { value: 0 } });
-        } else if (onoff === true && dim === undefined) {
-          await this.app!.updateDeviceState(this, { OnOff: { value: 1 } });
+        } else if (onoff === true) {
+          // OnOff value 1 is ignored by dimmer-only fixtures, and the level
+          // was just set to 0. Restore the previous dim level, or full on.
+          const requested = dim !== undefined ? dim : this.getCapabilityValue('dim');
+          const value = typeof requested === 'number' && requested > 0
+            ? Math.max(0, Math.min(1, requested))
+            : 1;
+          await this.app!.updateDeviceState(this, { OnOff: { value: 1 }, Dimmer: { value } });
         } else if (dim !== undefined) {
-          // Dimmer value must be in the 0..1 range (Homey `dim` is already 0..1).
           const value = Math.max(0, Math.min(1, dim));
           await this.app!.updateDeviceState(this, { Dimmer: { value } });
         }
@@ -95,6 +100,22 @@ export default class LuminaireDevice extends Homey.Device {
 
   updateState(state: any) {
     console.log('LuminaireDevice.updateState with state: ', JSON.stringify(state));
+
+    // Cloud control only reaches the lights through the Casambi gateway.
+    // Local control in the Casambi app uses Bluetooth and still works when
+    // the cloud gateway link is down. Homey uses the cloud link.
+    if (state.online === false) {
+      if (this.getAvailable()) {
+        this.setUnavailable(
+          'Casambi gateway is not connected to the cloud. Enable Gateway in the Casambi app and leave it open.',
+        ).catch(this.error);
+      }
+      return;
+    }
+
+    if (state.online === true && !this.getAvailable()) {
+      this.setAvailable().catch(this.error);
+    }
 
     // The unitChanged event reports state either as a top-level dimLevel
     // or inside a `controls` array. Handle both for robustness.

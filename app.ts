@@ -27,13 +27,15 @@ export default class CasambiApp extends Homey.App {
   }
 
   getClientForUser(username: string, password: string): Client {
-    this.log(`Casambi getClientFor: ${username}`);
+    // The same account can be saved with different email casing, which
+    // opened two WebSocket sessions to the same network.
+    const normalizedUser = `${username}`.trim().toLowerCase();
+    this.log(`Casambi getClientFor: ${normalizedUser}`);
 
-    const key = crypto.createHash('md5').update(username + password).digest('hex');
+    const key = crypto.createHash('md5').update(normalizedUser + password).digest('hex');
 
     if (!(key in this.clients)) {
-      // this.log(` - building client for ${username}`);
-      this.clients[key] = new Client(Homey.env.API_KEY, `${username}`, password);
+      this.clients[key] = new Client(Homey.env.API_KEY, normalizedUser, password);
     // } else {
       // this.log(` - returning client ${username} from cache`);
     }

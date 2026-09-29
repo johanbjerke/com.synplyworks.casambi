@@ -25,5 +25,14 @@
   },
   "0.6.0": {
     "en": "Fix app crash on startup with newer Homey CLI (guard inspector.open), and recognise Casambi's updated wire-open acknowledgement (\"openWireSucceed\") so control commands are sent again."
+  },
+  "0.6.1": {
+    "en": "Show lights as unavailable when the Casambi gateway is offline, so Homey no longer looks connected while commands cannot reach the luminaires. Share one session when the same account is saved with different email casing."
+  },
+  "0.6.2": {
+    "en": "Clarify the offline message: Homey needs the Casambi app's Gateway mode connected to the cloud."
+  },
+  "0.6.3": {
+    "en": "Turn lights back on by restoring the dimmer level. Dimmer-only Casambi fixtures ignore an OnOff-only command, so they stayed off."
   }
 }

@@ -120,6 +120,8 @@ export default class Client {
 
   protected isLoggingIn = false;
 
+  protected gatewayName?: string;
+
   protected unitChangedNetworkCallbacks: UnitChangedHandlerNetworkList = {};
   protected connectedDevices: { [key: string]: LuminaireDevice } = {};
 
@@ -323,6 +325,9 @@ export default class Client {
             this.wireStates[sessionKey].opened = true;
             console.log(`Client: wire ${this.wire} opened for ${sessionKey} (status "${data.wireStatus}"), flushing queue`);
             this.flushQueue(socket, sessionKey);
+            this.publishNetworkState(network, sessionKey).catch((err) => {
+              console.log('Client: failed to publish network state', err);
+            });
           } else {
             // Any other wireStatus is an error condition worth surfacing.
             console.log(`Client: WARNING wire status "${data.wireStatus}" - control messages may be rejected`);
@@ -339,13 +344,7 @@ export default class Client {
             }
 
             console.log("Client: webSocket.onmessage(event) method=unitChanged data: ", JSON.stringify(data));
-            if (sessionKey in this.unitChangedNetworkCallbacks) {
-              this.unitChangedNetworkCallbacks[sessionKey].forEach(({ deviceId, unitChangedCallback }) => {
-                if (deviceId === data.id) {
-                  unitChangedCallback(data);
-                }
-              }); // TODO: for devices else info log and store lateststate for later usage
-            }
+            this.dispatchUnit(sessionKey, data);
           } else if (data.method === 'networkUpdated') {
             // Network changed event, for example device added to a group within the network
             // Network setting or composition has somehow changed.
@@ -353,8 +352,12 @@ export default class Client {
             // re-sending the OPEN message to WebSocket is recommended. *
             console.log('Client: networkUpdated event received');
           } else if (data.method === 'peerChanged') {
-            // Devices online changed event, for example new device has joined the network
-            // In most cases no action required.
+            // Gateway joined or left the network. Refresh unit online flags so
+            // devices become available again when the gateway returns.
+            console.log('Client: peerChanged', JSON.stringify(data));
+            this.publishNetworkState(network, sessionKey).catch((err) => {
+              console.log('Client: failed to publish network state after peerChanged', err);
+            });
           } else {
             console.log('Client: unhandled websocket method', data.method, JSON.stringify(data));
           }
@@ -378,6 +381,38 @@ export default class Client {
     }
 
     return this.sockets[sessionKey];
+  }
+
+  protected dispatchUnit(sessionKey: string, unit: any) {
+    if (!(sessionKey in this.unitChangedNetworkCallbacks)) {
+      return;
+    }
+
+    const state = this.gatewayName ? { ...unit, gatewayName: this.gatewayName } : unit;
+    this.unitChangedNetworkCallbacks[sessionKey].forEach(({ deviceId, unitChangedCallback }) => {
+      if (deviceId === unit.id || String(deviceId) === String(unit.id)) {
+        unitChangedCallback(state);
+      }
+    });
+  }
+
+  // REST state includes each unit's `online` flag even when the WebSocket
+  // does not push a unitChanged snapshot. Homey uses that flag to show the
+  // gateway as offline instead of a live on/off control.
+  protected async publishNetworkState(network: Network, sessionKey: string) {
+    const state = await this.getNetworkState(network.id);
+    const gatewayName = state.gateway && state.gateway.name;
+    if (gatewayName) {
+      this.gatewayName = gatewayName;
+    }
+
+    const units = state.units ? Object.values(state.units) : [];
+    const offline = units.filter((unit) => unit && unit.online === false).length;
+    console.log(
+      `Client: network state gateway="${this.gatewayName || 'unknown'}" units=${units.length} offline=${offline}`,
+    );
+
+    units.forEach((unit) => this.dispatchUnit(sessionKey, unit));
   }
 
   protected reconnect(network: Network, timer: NodeJS.Timer) {
