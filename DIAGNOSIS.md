@@ -161,3 +161,41 @@ logs.
   paste those lines if control breaks again; they are the next protocol change.
 - `ERROR API key rejected` — the key is not WebSocket-enabled.
 - `session expired, re-authenticating` — should recover by itself.
+
+## v0.6.5: "available but no control"
+
+Symptom: lights stay available in Homey, but commands do nothing.
+
+Why 0.6.4 could not notice it:
+- `controlUnit` is fire-and-forget. Casambi has no command ack, so a
+  command sent into a dead wire just disappears.
+- Availability is driven by the REST poll (`online` per unit), which goes
+  through a different path (HTTPS) than control (WebSocket wire). REST can be
+  fine while the wire is dead, so devices stay available.
+- `wire.opened` was set once and never cleared, except on socket close. A
+  later non-open `wireStatus` (server closed or rejected the wire) was only
+  logged, and an OPEN that was never acknowledged left every control queued
+  forever.
+- Pong timeouts were only checked at the next ping (2 min), and a socket
+  that is open locally but dead upstream (half-open TCP) was never detected.
+
+What the app does now:
+- Every `controlUnit` waits up to 10 s for proof that it worked: a
+  `unitChanged` for that unit matching the target dim level, or failing
+  that, the REST state matching it. If there is no proof, it reconnects
+  (new socket and OPEN) and resends that command once. If the resend also
+  isn't confirmed, `controlOk` becomes false and the Casambi session is
+  refreshed (re-login and reconnect).
+- Ping every 60 s, and reconnect if there's no pong within 20 s.
+- Reconnect if the OPEN isn't acknowledged within 30 s, if nothing arrives
+  on the socket for 3 min, or on any non-value `wireStatus` error.
+- `GET /api/app/com.synplyworks.casambi/health` reports socket and wire
+  state, last rx/pong/unitChanged/REST times, command sent/acked counts,
+  `controlOk`, reconnect counts and reasons, and the last 15 health events.
+  It contains no credentials.
+
+Limit: an idle wire can't be proven to reach the luminaires without
+sending a command, and we never send probe commands because they could
+change a light visibly. Between commands, health means the cloud wire is
+alive. The first command after a silent break is confirmed (or recovered)
+within about 10 to 20 s.

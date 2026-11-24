@@ -258,3 +258,35 @@ export function interpretCasambiMessage(data: unknown): CasambiAction[] {
 export function isSessionHttpStatus(status: number): boolean {
   return status === 401 || status === 403;
 }
+
+export type TargetMatch = 'match' | 'mismatch' | 'unknown';
+
+/**
+ * Compare a reported unit state with the targetControls of a controlUnit
+ * command we sent. Used to confirm a command actually reached the luminaire
+ * (Casambi has no explicit command ack; the proof is the unit's new state).
+ *
+ * - Dimmer targets are compared on dimLevel (tolerance 0.02; fades can report
+ *   intermediate levels, which count as mismatch-for-now, not failure).
+ * - Commands without a Dimmer target (colour, temperature) cannot be checked
+ *   from the state reliably, so any state for the unit returns 'unknown'.
+ */
+export function controlTargetMatches(state: unknown, targetControls: unknown): TargetMatch {
+  const target = asRecord(targetControls);
+  if (!target) {
+    return 'unknown';
+  }
+  const dimmer = asRecord(target.Dimmer);
+  const wanted = dimmer ? numericValue(dimmer.value) : undefined;
+  if (wanted === undefined) {
+    return 'unknown';
+  }
+  const parsed = parseUnitState(state);
+  if (parsed.dimLevel !== undefined) {
+    return Math.abs(parsed.dimLevel - wanted) <= 0.02 ? 'match' : 'mismatch';
+  }
+  if (parsed.on !== undefined) {
+    return parsed.on === (wanted > 0) ? 'match' : 'mismatch';
+  }
+  return 'unknown';
+}

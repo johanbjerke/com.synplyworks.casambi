@@ -1,6 +1,8 @@
 import fetch, {HeaderInit} from 'node-fetch';
 import WebSocket from 'ws';
 import {
+  classifyWireStatus,
+  controlTargetMatches,
   interpretCasambiMessage,
   isSessionHttpStatus,
   toUnitId,
@@ -8,8 +10,17 @@ import {
 
 export const BASE_URL = 'https://door.casambi.com/v1';
 
-const PING_INTERVAL_MS = 2 * 60 * 1000;
-const PONG_GRACE_MS = 30 * 1000;
+const PING_INTERVAL_MS = 60 * 1000;
+const PONG_GRACE_MS = 20 * 1000;
+// Casambi has no command ack. A controlUnit is confirmed when the unit's
+// new state comes back (unitChanged) or shows up in REST state.
+const ACK_TIMEOUT_MS = 10 * 1000;
+// Pongs arrive every PING_INTERVAL_MS, so this much silence means the
+// socket is open on our side but dead on the server side.
+const RX_SILENT_MS = 3 * 60 * 1000;
+// OPEN must be acknowledged (openWireSucceed) or controls queue forever.
+const OPEN_ACK_TIMEOUT_MS = 30 * 1000;
+const MAX_HEALTH_EVENTS = 40;
 const STATE_POLL_INTERVAL_MS = 60 * 1000;
 const RECONNECT_MIN_MS = 3000;
 const RECONNECT_MAX_MS = 60 * 1000;
@@ -94,6 +105,42 @@ interface UnitChangedHandlerNetworkList {
   [networkId: string]: Array<UnitChangedHandlerId>;
 }
 
+interface PendingAck {
+  unitId: number;
+  data: string;
+  targetControls: unknown;
+  sentAt: number;
+  retried: boolean;
+  timer: NodeJS.Timeout;
+}
+
+export interface NetworkHealth {
+  networkId: string;
+  socketOpenedAt?: number;
+  wireOpenedAt?: number;
+  lastWireStatus?: string;
+  lastRxAt?: number;
+  lastPingAt?: number;
+  lastPongAt?: number;
+  lastUnitChangedAt?: number;
+  lastControlSentAt?: number;
+  lastControlAckAt?: number;
+  lastAckVia?: string;
+  controlOk: boolean | null;
+  controlsSent: number;
+  controlsAcked: number;
+  ackTimeouts: number;
+  consecutiveAckFailures: number;
+  reconnects: number;
+  lastReconnectAt?: number;
+  lastReconnectReason?: string;
+  lastRestOkAt?: number;
+  lastRestError?: string;
+  unitsTotal?: number;
+  unitsOffline?: number;
+  events: Array<{ at: string; msg: string }>;
+}
+
 interface SocketMeta {
   generation: number;
   lastPongAt: number;
@@ -136,6 +183,12 @@ export default class Client {
   protected lastUnitChangedAt: { [networkId: string]: number } = {};
 
   protected unitChangedNetworkCallbacks: UnitChangedHandlerNetworkList = {};
+
+  protected pendingAcks: { [networkId: string]: { [unitId: string]: PendingAck } } = {};
+
+  protected retriedControls: Set<string> = new Set();
+
+  protected health: { [networkId: string]: NetworkHealth } = {};
 
   constructor(token: string, username: string, password: string) {
     this.token = token;
@@ -226,7 +279,7 @@ export default class Client {
     );
 
     if (socket.readyState === WebSocket.OPEN && wireState && wireState.opened) {
-      this.rawSend(socket, data);
+      this.sendControl(socket, networkId, data);
     } else {
       console.log('Client.updateDeviceState: wire not ready, queueing control message');
       this.enqueueControl(networkId, data);
@@ -262,7 +315,7 @@ export default class Client {
     while (wireState.queue.length > 0) {
       const msg = wireState.queue.shift() as string;
       console.log('Client.flushQueue: sending queued control message');
-      this.rawSend(socket, msg);
+      this.sendControl(socket, networkId, msg);
     }
   }
 
@@ -304,15 +357,23 @@ export default class Client {
       if (!this.isCurrentSocket(networkId, socket, generation)) {
         return;
       }
+      this.getHealthEntry(networkId).socketOpenedAt = Date.now();
       this.sendOpenMessage(networkId, socket).catch((err) => {
         console.log('Client: failed to send OPEN message', err);
       });
+      setTimeout(() => {
+        if (this.isCurrentSocket(networkId, socket, generation) && !this.ensureWireState(networkId).opened) {
+          this.healthEvent(networkId, 'OPEN not acknowledged within 30s, reconnecting');
+          this.scheduleReconnect(networkId, 'open-ack-timeout');
+        }
+      }, OPEN_ACK_TIMEOUT_MS);
     });
 
     socket.on('message', (raw: WebSocket.RawData) => {
       if (!this.isCurrentSocket(networkId, socket, generation)) {
         return;
       }
+      this.getHealthEntry(networkId).lastRxAt = Date.now();
       this.handleSocketMessage(networkId, socket, raw);
     });
 
@@ -386,12 +447,19 @@ export default class Client {
         if (meta) {
           meta.lastPongAt = Date.now();
         }
+        this.getHealthEntry(networkId).lastPongAt = Date.now();
         console.log('Client: keep-alive pong received');
         break;
       }
       case 'wire-open': {
         this.ensureWireState(networkId).opened = true;
         this.reconnectDelayMs[networkId] = RECONNECT_MIN_MS;
+        {
+          const h = this.getHealthEntry(networkId);
+          h.wireOpenedAt = Date.now();
+          h.lastWireStatus = action.status;
+        }
+        this.healthEvent(networkId, `wire opened (${action.status})`);
         if (!action.known) {
           console.log(
             `Client: WARNING unknown open acknowledgement "${action.status}" - treating as wire open. Full message:`,
@@ -441,6 +509,14 @@ export default class Client {
           `Client: WARNING ${knownLabel} wireStatus "${action.status}" - control messages may be rejected. Full message:`,
           JSON.stringify(raw),
         );
+        this.getHealthEntry(networkId).lastWireStatus = action.status;
+        this.healthEvent(networkId, `wireStatus "${action.status}"`);
+        // A non-value error on an open wire (e.g. the server closed the wire)
+        // leaves us sending into nothing. Re-open instead of staying stale.
+        if (classifyWireStatus(action.status).kind !== 'value') {
+          this.ensureWireState(networkId).opened = false;
+          this.scheduleReconnect(networkId, `wireStatus ${action.status}`);
+        }
         break;
       }
       case 'unitChanged': {
@@ -449,7 +525,9 @@ export default class Client {
           this.flushQueue(socket, networkId);
         }
         this.lastUnitChangedAt[networkId] = Date.now();
+        this.getHealthEntry(networkId).lastUnitChangedAt = Date.now();
         console.log('Client: webSocket method=unitChanged data:', JSON.stringify(action.payload));
+        this.checkAck(networkId, action.payload, 'unitChanged');
         this.dispatchUnit(networkId, action.payload);
         break;
       }
@@ -520,6 +598,13 @@ export default class Client {
 
     const units = state.units ? Object.values(state.units) : [];
     const offline = units.filter((unit) => unit && unit.online === false).length;
+    {
+      const h = this.getHealthEntry(networkId);
+      h.lastRestOkAt = Date.now();
+      h.lastRestError = undefined;
+      h.unitsTotal = units.length;
+      h.unitsOffline = offline;
+    }
     const lastWs = this.lastUnitChangedAt[networkId];
     const wsFresh = !!lastWs && (Date.now() - lastWs) < (2 * STATE_POLL_INTERVAL_MS);
     const trustRestOnline = (opts && opts.trustRestOnline) || !wsFresh;
@@ -567,17 +652,25 @@ export default class Client {
       return;
     }
 
-    if (meta.pingAt && Date.now() - meta.pingAt > PONG_GRACE_MS && meta.lastPongAt < meta.pingAt) {
-      console.log('Client: no pong since last ping, reconnecting', networkId);
-      this.scheduleReconnect(networkId, 'pong-timeout');
-      return;
-    }
-
-    meta.pingAt = Date.now();
+    const pingAt = Date.now();
+    meta.pingAt = pingAt;
+    this.getHealthEntry(networkId).lastPingAt = pingAt;
+    const { generation } = meta;
     this.rawSend(socket, JSON.stringify({
       method: 'ping',
       wire: this.wire,
     }));
+    setTimeout(() => {
+      const current = this.socketMeta[networkId];
+      if (!current || current.generation !== generation || this.sockets[networkId] !== socket) {
+        return;
+      }
+      if (current.lastPongAt < pingAt) {
+        console.log('Client: no pong within grace period, reconnecting', networkId);
+        this.healthEvent(networkId, 'no pong within 20s, reconnecting');
+        this.scheduleReconnect(networkId, 'pong-timeout');
+      }
+    }, PONG_GRACE_MS);
   }
 
   protected ensurePoll(networkId: string) {
@@ -600,12 +693,25 @@ export default class Client {
         return;
       }
       console.log('Client: poll could not fetch network state', err);
+      this.getHealthEntry(networkId).lastRestError = err instanceof Error ? err.message : String(err);
     }
 
     const socket = this.sockets[networkId];
     if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
       const network = await this.getNetwork(networkId);
       this.getSocket(network);
+      return;
+    }
+
+    // Open-but-dead socket: nothing (not even pongs) received for a while.
+    const h = this.getHealthEntry(networkId);
+    const wireState = this.wireStates[networkId];
+    if (socket.readyState === WebSocket.OPEN && wireState && wireState.opened) {
+      const lastRx = h.lastRxAt || h.wireOpenedAt || 0;
+      if (Date.now() - lastRx > RX_SILENT_MS) {
+        this.healthEvent(networkId, 'no websocket traffic for 3 min, reconnecting');
+        this.scheduleReconnect(networkId, 'rx-silent');
+      }
     }
   }
 
@@ -616,6 +722,12 @@ export default class Client {
     }
 
     this.discardSocket(networkId, true);
+    {
+      const h = this.getHealthEntry(networkId);
+      h.reconnects += 1;
+      h.lastReconnectAt = Date.now();
+      h.lastReconnectReason = reason;
+    }
 
     const delay = this.reconnectDelayMs[networkId] || RECONNECT_MIN_MS;
     const nextDelay = Math.min(Math.max(delay, RECONNECT_MIN_MS) * 2, RECONNECT_MAX_MS);
@@ -696,6 +808,187 @@ export default class Client {
     } catch (err) {
       throw new Error(`getting devices failed: invalid JSON: ${body}`);
     }
+  }
+
+  // ---- control confirmation and health -------------------------------------
+
+  protected getHealthEntry(networkId: string): NetworkHealth {
+    if (!this.health[networkId]) {
+      this.health[networkId] = {
+        networkId,
+        controlOk: null,
+        controlsSent: 0,
+        controlsAcked: 0,
+        ackTimeouts: 0,
+        consecutiveAckFailures: 0,
+        reconnects: 0,
+        events: [],
+      };
+    }
+    return this.health[networkId];
+  }
+
+  protected healthEvent(networkId: string, msg: string) {
+    console.log(`Client: health ${networkId}: ${msg}`);
+    const h = this.getHealthEntry(networkId);
+    h.events.push({ at: new Date().toISOString(), msg });
+    while (h.events.length > MAX_HEALTH_EVENTS) {
+      h.events.shift();
+    }
+  }
+
+  protected sendControl(socket: WebSocket, networkId: string, data: string) {
+    this.rawSend(socket, data);
+    const h = this.getHealthEntry(networkId);
+    h.lastControlSentAt = Date.now();
+    h.controlsSent += 1;
+
+    let parsed: { id?: unknown; targetControls?: unknown };
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return;
+    }
+    const unitId = Number(parsed.id);
+    if (!Number.isFinite(unitId)) {
+      return;
+    }
+
+    if (!this.pendingAcks[networkId]) {
+      this.pendingAcks[networkId] = {};
+    }
+    const pending = this.pendingAcks[networkId];
+    const key = String(unitId);
+    if (pending[key]) {
+      // A newer command for the same unit supersedes the older one.
+      clearTimeout(pending[key].timer);
+    }
+    const retried = this.retriedControls.has(data);
+    this.retriedControls.delete(data);
+    const entry: PendingAck = {
+      unitId,
+      data,
+      targetControls: parsed.targetControls,
+      sentAt: Date.now(),
+      retried,
+      timer: setTimeout(() => {
+        this.onAckTimeout(networkId, entry).catch((err) => {
+          console.log('Client: ack timeout handling failed', err);
+        });
+      }, ACK_TIMEOUT_MS),
+    };
+    pending[key] = entry;
+  }
+
+  protected resolveAck(networkId: string, entry: PendingAck, via: string) {
+    const pending = this.pendingAcks[networkId];
+    if (!pending || pending[String(entry.unitId)] !== entry) {
+      return;
+    }
+    clearTimeout(entry.timer);
+    delete pending[String(entry.unitId)];
+    const h = this.getHealthEntry(networkId);
+    h.lastControlAckAt = Date.now();
+    h.lastAckVia = via;
+    h.controlsAcked += 1;
+    if (h.controlOk === false || h.consecutiveAckFailures > 0) {
+      this.healthEvent(networkId, `control confirmed again (unit ${entry.unitId} via ${via})`);
+    }
+    h.consecutiveAckFailures = 0;
+    h.controlOk = true;
+    console.log(`Client: control for unit ${entry.unitId} confirmed via ${via} after ${Date.now() - entry.sentAt}ms`);
+  }
+
+  protected checkAck(networkId: string, unit: any, via: string) {
+    const pending = this.pendingAcks[networkId];
+    if (!pending || !unit || unit.id === undefined) {
+      return;
+    }
+    const entry = pending[String(unit.id)];
+    if (!entry) {
+      return;
+    }
+    // 'mismatch' may be an intermediate fade level; keep waiting until timeout.
+    if (controlTargetMatches(unit, entry.targetControls) !== 'mismatch') {
+      this.resolveAck(networkId, entry, via);
+    }
+  }
+
+  protected async onAckTimeout(networkId: string, entry: PendingAck) {
+    const pending = this.pendingAcks[networkId];
+    if (!pending || pending[String(entry.unitId)] !== entry) {
+      return;
+    }
+
+    // Last chance: the command may have worked without an event (e.g. the
+    // unit was already at that level). REST state is the cloud's view of
+    // the luminaire as reported by the gateway.
+    let restUnit: any;
+    try {
+      const state = await this.fetchNetworkState(networkId, true);
+      restUnit = state.units ? (state.units as any)[String(entry.unitId)] : undefined;
+      if (!restUnit && state.units) {
+        restUnit = Object.values(state.units).find((u: any) => u && String(u.id) === String(entry.unitId));
+      }
+    } catch (err) {
+      console.log('Client: REST check after ack timeout failed', err);
+    }
+    if (pending[String(entry.unitId)] !== entry) {
+      return; // superseded or acked meanwhile
+    }
+    if (restUnit && controlTargetMatches(restUnit, entry.targetControls) !== 'mismatch') {
+      this.resolveAck(networkId, entry, 'rest');
+      return;
+    }
+
+    delete pending[String(entry.unitId)];
+    const h = this.getHealthEntry(networkId);
+    h.ackTimeouts += 1;
+    h.consecutiveAckFailures += 1;
+    const offline = restUnit && restUnit.online === false ? ' (unit offline in Casambi)' : '';
+
+    if (!entry.retried) {
+      this.healthEvent(
+        networkId,
+        `unit ${entry.unitId} did not confirm control within 10s${offline}; reconnecting and resending once`,
+      );
+      this.retriedControls.add(entry.data);
+      this.enqueueControl(networkId, entry.data);
+      this.ensureWireState(networkId).opened = false;
+      this.reconnectDelayMs[networkId] = RECONNECT_MIN_MS;
+      this.scheduleReconnect(networkId, 'control-ack-timeout');
+      return;
+    }
+
+    h.controlOk = false;
+    this.healthEvent(
+      networkId,
+      `unit ${entry.unitId} still not confirmed after reconnect${offline}; refreshing Casambi session`,
+    );
+    this.refreshSessionAndReconnect(networkId).catch((err) => {
+      console.log('Client: session refresh after ack failure failed', err);
+    });
+  }
+
+  getHealth(): NetworkHealth[] {
+    const now = Date.now();
+    return Object.keys(this.health).map((networkId) => {
+      const h = this.health[networkId];
+      const socket = this.sockets[networkId];
+      const wireState = this.wireStates[networkId];
+      const pending = this.pendingAcks[networkId] || {};
+      const states = ['connecting', 'open', 'closing', 'closed'];
+      return {
+        ...h,
+        events: h.events.slice(-15),
+        socketState: socket ? states[socket.readyState] : 'none',
+        wireOpened: !!(wireState && wireState.opened),
+        queued: wireState ? wireState.queue.length : 0,
+        pendingAcks: Object.keys(pending).length,
+        rxAgeSec: h.lastRxAt ? Math.round((now - h.lastRxAt) / 1000) : null,
+        restAgeSec: h.lastRestOkAt ? Math.round((now - h.lastRestOkAt) / 1000) : null,
+      } as NetworkHealth;
+    });
   }
 
   protected isLikelySessionError(err: unknown): boolean {
