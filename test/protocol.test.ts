@@ -1,6 +1,7 @@
 import assert from 'assert';
 import {
   classifyWireStatus,
+  controlTargetMatches,
   interpretCasambiMessage,
   isSessionHttpStatus,
   parseUnitState,
@@ -164,6 +165,26 @@ test('HTTP 401/403 are session failures', () => {
   assert.strictEqual(isSessionHttpStatus(401), true);
   assert.strictEqual(isSessionHttpStatus(403), true);
   assert.strictEqual(isSessionHttpStatus(500), false);
+});
+
+test('controlTargetMatches confirms a dimmer command from dimLevel', () => {
+  assert.strictEqual(controlTargetMatches({ id: 3, dimLevel: 0.5 }, { Dimmer: { value: 0.5 } }), 'match');
+  assert.strictEqual(controlTargetMatches({ id: 3, dimLevel: 0.51 }, { Dimmer: { value: 0.5 } }), 'match');
+  assert.strictEqual(controlTargetMatches({ id: 3, dimLevel: 0.2 }, { Dimmer: { value: 0.5 } }), 'mismatch');
+});
+
+test('controlTargetMatches confirms off from dimLevel 0 or controls', () => {
+  assert.strictEqual(controlTargetMatches({ id: 3, dimLevel: 0 }, { OnOff: { value: 0 }, Dimmer: { value: 0 } }), 'match');
+  assert.strictEqual(
+    controlTargetMatches({ id: 3, controls: [{ type: 'Dimmer', value: 0 }] }, { Dimmer: { value: 0 } }),
+    'match',
+  );
+  assert.strictEqual(controlTargetMatches({ id: 3, on: true }, { Dimmer: { value: 0 } }), 'mismatch');
+});
+
+test('controlTargetMatches cannot judge colour-only commands', () => {
+  assert.strictEqual(controlTargetMatches({ id: 3, dimLevel: 0.4 }, { RGB: { hue: 0.1, sat: 1 } }), 'unknown');
+  assert.strictEqual(controlTargetMatches({ id: 3 }, { Dimmer: { value: 0.4 } }), 'unknown');
 });
 
 console.log(`${passed} passed, ${failed} failed`);

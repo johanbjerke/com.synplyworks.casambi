@@ -1,6 +1,6 @@
 {
   "id": "com.synplyworks.casambi",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "compatibility": ">=5.0.0",
   "sdk": 3,
   "brandColor": "#FFA500",
@@ -44,5 +44,11 @@
     "url": "https://github.com/lvanderree/com.synplyworks.casambi/issues"
   },
   "homeyCommunityTopicId": 42512,
-  "source": "https://github.com/lvanderree/com.synplyworks.casambi"
+  "source": "https://github.com/lvanderree/com.synplyworks.casambi",
+  "api": {
+    "getHealth": {
+      "method": "GET",
+      "path": "/health"
+    }
+  }
 }

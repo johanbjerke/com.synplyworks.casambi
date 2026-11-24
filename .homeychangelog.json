@@ -37,5 +37,8 @@
   },
   "0.6.4": {
     "en": "Recover automatically after Casambi firmware, gateway and session drops: ignore stale websocket reconnects, refresh expired sessions, re-open the wire on networkUpdated, poll REST state, and accept renamed server acknowledgements so on/off/dim and status keep working."
+  },
+  "0.6.5": {
+    "en": "Detect lights that look connected but no longer respond: every command is now confirmed against the light's reported state, and if it is not confirmed within 10 seconds the app reconnects and resends it once. Also reconnects when the cloud stops answering keep-alives, the wire open is never acknowledged, or the server closes the wire. Adds a health endpoint for monitoring."
   }
 }
