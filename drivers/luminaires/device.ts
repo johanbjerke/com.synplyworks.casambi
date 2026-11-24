@@ -1,5 +1,6 @@
 import Homey from 'homey';
 import CasambiApp from '../../app';
+import { parseUnitState } from '../../lib/protocol';
 
 export default class LuminaireDevice extends Homey.Device {
   protected app?: CasambiApp;
@@ -101,10 +102,12 @@ export default class LuminaireDevice extends Homey.Device {
   updateState(state: any) {
     console.log('LuminaireDevice.updateState with state: ', JSON.stringify(state));
 
+    const parsed = parseUnitState(state);
+
     // Cloud control only reaches the lights through the Casambi gateway.
     // Local control in the Casambi app uses Bluetooth and still works when
     // the cloud gateway link is down. Homey uses the cloud link.
-    if (state.online === false) {
+    if (parsed.online === false) {
       if (this.getAvailable()) {
         this.setUnavailable(
           'Casambi gateway is not connected to the cloud. Enable Gateway in the Casambi app and leave it open.',
@@ -113,33 +116,28 @@ export default class LuminaireDevice extends Homey.Device {
       return;
     }
 
-    if (state.online === true && !this.getAvailable()) {
+    // unitChanged after a firmware/gateway blip often omits `online`. Treat any
+    // non-offline update as proof the cloud path is live again.
+    if (!this.getAvailable()) {
       this.setAvailable().catch(this.error);
     }
 
-    // The unitChanged event reports state either as a top-level dimLevel
-    // or inside a `controls` array. Handle both for robustness.
-    let dimLevel: number | undefined;
-
-    if ('dimLevel' in state && state.dimLevel != undefined) {
-      dimLevel = state.dimLevel;
-    } else if (Array.isArray(state.controls)) {
-      const dimmer = state.controls.find((c: any) => c && (c.type === 'Dimmer' || c.name === 'dimmer'));
-      if (dimmer && dimmer.value != undefined) {
-        dimLevel = dimmer.value;
-      }
-    }
-
-    if (dimLevel != undefined) {
-      if (!dimLevel) {
+    if (parsed.dimLevel !== undefined) {
+      if (!parsed.dimLevel) {
         this.setCapabilityValue('onoff', false).catch(this.error);
       } else {
         this.setCapabilityValue('onoff', true).catch(this.error);
-        this.setCapabilityValue('dim', dimLevel).catch(this.error);
+        this.setCapabilityValue('dim', parsed.dimLevel).catch(this.error);
       }
-    } else {
-      console.log('LuminaireDevice.updateState! Could not update, no dimlevel in state!', JSON.stringify(state));
+      return;
     }
+
+    if (parsed.on !== undefined) {
+      this.setCapabilityValue('onoff', parsed.on).catch(this.error);
+      return;
+    }
+
+    console.log('LuminaireDevice.updateState! Could not update, no dim/on in state!', JSON.stringify(state));
   }
 }
 

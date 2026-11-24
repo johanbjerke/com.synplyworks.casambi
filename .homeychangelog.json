@@ -34,5 +34,8 @@
   },
   "0.6.3": {
     "en": "Turn lights back on by restoring the dimmer level. Dimmer-only Casambi fixtures ignore an OnOff-only command, so they stayed off."
+  },
+  "0.6.4": {
+    "en": "Recover automatically after Casambi firmware, gateway and session drops: ignore stale websocket reconnects, refresh expired sessions, re-open the wire on networkUpdated, poll REST state, and accept renamed server acknowledgements so on/off/dim and status keep working."
   }
 }

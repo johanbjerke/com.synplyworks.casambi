@@ -24,7 +24,8 @@
   },
   "scripts": {
     "lint": "eslint . --ext .ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "ts-node --transpile-only --compiler-options '{\"module\":\"commonjs\",\"esModuleInterop\":true}' test/protocol.test.ts"
   },
   "engines": {
     "node": ">=12.16.1"
